@@ -1,0 +1,794 @@
+import os
+import requests
+import random
+import json
+import re
+from datetime import datetime
+import pyttsx3
+from threading import Thread
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk, ImageSequence
+import subprocess
+import math
+import tempfile
+
+# מפתח ה-API של OpenAI - עדכן כאן את המפתח שלך
+OPENAI_API_KEY = "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"
+
+# נתיב לגיף
+gif_path = r"C:\Users\akiva\Downloads\giphy-downsized-large.gif"
+
+# שם הקובץ לשמירת מזהי סרטונים שכבר הורדו
+downloaded_videos_file = "downloaded_videos.json"
+
+# יצירת session גלובלי
+session = requests.Session()
+
+# נתיבים לתיקיות המוזיקה
+music_folders = {
+    "opt": r"C:\Users\akiva\Downloads\aki\opt",
+    "tense": r"C:\Users\akiva\Downloads\aki\tense",
+    "sad": r"C:\Users\akiva\Downloads\aki\sad"
+}
+
+def load_downloaded_videos():
+    """
+    טוען מזהי סרטונים שהורדו מקובץ JSON (אם קיים).
+    """
+    if os.path.exists(downloaded_videos_file):
+        with open(downloaded_videos_file, "r", encoding='utf-8') as file:
+            return json.load(file)
+    return []
+
+def save_downloaded_videos(downloaded_videos):
+    """
+    שומר מזהי סרטונים שהורדו לקובץ JSON.
+    """
+    with open(downloaded_videos_file, "w", encoding='utf-8') as file:
+        json.dump(downloaded_videos, file, ensure_ascii=False, indent=4)
+
+def create_unique_folder(base_folder):
+    """
+    יוצר תיקייה ייחודית עם timestamp בתיקייה base_folder.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_folder = os.path.join(base_folder, timestamp)
+    os.makedirs(unique_folder, exist_ok=True)
+    print(f"Created unique folder at: {unique_folder}")
+    return unique_folder
+
+def split_text(text):
+    """
+    מחלץ כותרת, תוכן ומילות מפתח מהטקסט לפי סימני Unicode מוגדרים:
+    כותרת: ◤ … ◤  (u25E4)
+    תוכן:  ˜ … ˜  (u02DC)
+    מילות מפתח: ◆ … ◆ (u25C6)
+    """
+    title = re.findall(r"\u25E4(.*?)\u25E4", text, re.DOTALL)
+    content = re.findall(r"\u02DC(.*?)\u02DC", text, re.DOTALL)
+    keywords = re.findall(r"\u25C6(.*?)\u25C6", text)
+    print(f"Extracted Title: {title}")
+    print(f"Extracted Content: {content}")
+    print(f"Extracted Keywords: {keywords}")
+    return title, content, keywords
+
+def generate_subtitles_from_text(
+    text,
+    speech_rate=150,      # מילים לדקה (words per minute)
+    char_rate=900,        # תווים לדקה (chars per minute)
+    max_words=5,
+    subtitle_offset=0.0
+):
+    """
+    יוצר רשימה של כתוביות מהטקסט הנתון, בשקלול מספר מילים + מספר תווים.
+    
+    :param text: הטקסט המלא (למשל התוכן שתרגמנו ל-TTS).
+    :param speech_rate: קצב דיבור במילים לדקה (150 = ברירת מחדל).
+    :param char_rate: קצב "דיבור" לתווים לדקה (900 = ברירת מחדל, אפשר לכוונן).
+    :param max_words: מספר המילים המרבי בכל כתובית.
+    :param subtitle_offset: offset (בשניות) להזזת הכתוביות קדימה/אחורה.
+    :return: רשימת מילונים, כל אחד מייצג כתובית עם index, text, start_time, end_time.
+    """
+    if not text.strip():
+        return []
+
+    words = text.split()
+    total_words = len(words)
+    if total_words == 0:
+        return []
+
+    # לצורך חישוב זמן כולל לפי תווים
+    total_chars = sum(len(w) for w in words)
+
+    subtitles = []
+    current_time = 0.0
+
+    # זמן כולל לפי מילים
+    total_word_time = total_words / (speech_rate / 60.0)  # בשניות
+    # זמן כולל לפי תווים
+    if total_chars > 0:
+        total_char_time = total_chars / (char_rate / 60.0)
+    else:
+        total_char_time = 0.0
+
+    # זמן ממוצע למילה/תו
+    avg_word_duration = total_word_time / total_words
+    avg_char_duration = (
+        total_char_time / total_chars if total_chars > 0 else 0.0
+    )
+
+    # פיצול למקטעים לפי max_words
+    for i in range(0, total_words, max_words):
+        sub_words = words[i:i+max_words]
+        sub_text = ' '.join(sub_words)
+
+        word_count = len(sub_words)
+        char_count = sum(len(w) for w in sub_words)
+
+        # זמן לפי מילים
+        time_by_words = word_count * avg_word_duration
+        # זמן לפי תווים
+        time_by_chars = char_count * avg_char_duration
+
+        # נבחר את הזמן הארוך מבין השניים (שיטה אחת אפשרית)
+        duration = max(time_by_words, time_by_chars)
+
+        start_time = current_time
+        end_time = current_time + duration
+
+        # הוספת offset
+        start_time += subtitle_offset
+        end_time += subtitle_offset
+
+        subtitles.append({
+            "index": len(subtitles) + 1,
+            "text": sub_text,
+            "start_time": start_time,
+            "end_time": end_time
+        })
+
+        current_time += duration
+
+    print(f"Generated {len(subtitles)} subtitles.")
+    return subtitles
+
+def generate_audio_and_subtitles_from_text(
+    text,
+    output_folder,
+    progress_callback,
+    selected_voice=None,
+    speech_rate=150,
+    char_rate=900,
+    max_words=5,
+    subtitle_offset=0.0
+):
+    """
+    יוצר קובץ שמע מטקסט (TTS) ורשימת כתוביות המחושבת גם לפי מספר מילים וגם לפי אורך השורה בתווים.
+    """
+    if not text.strip():
+        return None, []
+
+    audio_path = os.path.join(output_folder, "text_to_speech.mp3")
+    engine = pyttsx3.init()
+    if selected_voice:
+        engine.setProperty('voice', selected_voice)
+    engine.setProperty('rate', speech_rate)
+
+    progress_callback("Generating audio...", 50)
+    print(f"Saving TTS audio to: {audio_path}")
+    engine.save_to_file(text, audio_path)
+    engine.runAndWait()
+    print("Audio generation complete.")
+    progress_callback("Audio generation complete!", 70)
+
+    # בדיקת יצירת קובץ השמע
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        print("Error: TTS audio file was not created properly.")
+        progress_callback("Error generating audio.", 0)
+        return None, []
+
+    progress_callback("Generating subtitles...", 80)
+    subtitles = generate_subtitles_from_text(
+        text=text,
+        speech_rate=speech_rate,
+        char_rate=char_rate,
+        max_words=max_words,
+        subtitle_offset=subtitle_offset
+    )
+    progress_callback("Subtitles generation complete!", 90)
+
+    return audio_path, subtitles
+
+def get_background_music(tag):
+    """
+    בוחר מוזיקה מתיקייה על בסיס התג: opt / tense / sad.
+    """
+    folder = music_folders.get(tag)
+    if folder and os.path.exists(folder):
+        music_files = [
+            f for f in os.listdir(folder)
+            if f.lower().endswith((".mp3", ".wav"))
+        ]
+        if music_files:
+            selected_music = os.path.join(folder, random.choice(music_files))
+            print(f"Selected background music: {selected_music}")
+            return selected_music
+    print(f"No background music found for tag: {tag}")
+    return None
+
+def download_video_for_keyword(api_key, keyword, download_folder, progress_callback):
+    """
+    מוריד סרטון אחד מ-Pixabay לפי מילת מפתח (keyword),
+    בטווח אורך 5-9 שניות, אם טרם הורד בעבר.
+    """
+    url = f"https://pixabay.com/api/videos/?key={api_key}&q={keyword}&order=popular"
+    try:
+        print(f"Downloading video for keyword: {keyword}")
+        response = session.get(url, verify=False)  # השבתת אימות SSL
+        response.raise_for_status()
+        data = response.json()
+        if 'hits' not in data or not data['hits']:
+            progress_callback(f"No videos found for keyword: {keyword}.", 0)
+            return None
+
+        downloaded_videos = load_downloaded_videos()
+        available_videos = [
+            v for v in data['hits']
+            if v['id'] not in downloaded_videos and 5 <= v['duration'] <= 9
+        ]
+
+        if not available_videos:
+            progress_callback(f"No videos in desired range for keyword: {keyword}.", 0)
+            return None
+
+        selected_video = random.choice(available_videos)
+        video_url = selected_video['videos']['large']['url']
+        video_id = selected_video['id']
+        video_path = os.path.join(download_folder, f"{keyword}_video_{video_id}.mp4")
+
+        print(f"Downloading video from URL: {video_url}")
+        video_response = session.get(video_url, verify=False, stream=True)  # השבתת אימות SSL
+        video_response.raise_for_status()
+        with open(video_path, "wb") as f:
+            for chunk in video_response.iter_content(chunk_size=512000):
+                if chunk:
+                    f.write(chunk)
+
+        downloaded_videos.append(video_id)
+        save_downloaded_videos(downloaded_videos)
+        progress_callback(f"Downloaded video for keyword: {keyword}.", 100)
+        print(f"Video downloaded to: {video_path}")
+        return video_path
+
+    except requests.exceptions.RequestException as e:
+        progress_callback(f"Failed to download video for keyword: {keyword}: {e}", 0)
+        print(f"Error downloading video for keyword {keyword}: {e}")
+        return None
+
+def normalize_videos(video_paths, output_folder):
+    """
+    מנרמל רשימת סרטונים ל-FullHD, 30fps, עם קידוד x264.
+    """
+    normalized_paths = []
+    for i, vp in enumerate(video_paths):
+        out_name = f"normalized_video_{i}.mp4"
+        out_path = os.path.join(output_folder, out_name)
+        cmd = [
+            "ffmpeg", "-y", "-i", vp,
+            "-vf", "scale=1920:1080,fps=30",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            out_path
+        ]
+        print(f"Normalizing video: {vp} -> {out_path}")
+        subprocess.run(cmd, check=True)
+        normalized_paths.append(out_path)
+    return normalized_paths
+
+def get_video_duration(video_path):
+    """
+    מחשב את אורך הסרטון (בשניות) באמצעות ffprobe.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-i", video_path, "-show_entries", "format=duration",
+             "-v", "quiet", "-of", "csv=p=0"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        duration = float(result.stdout.strip())
+        print(f"Duration of {video_path}: {duration} seconds")
+        return duration
+    except Exception as e:
+        print(f"Error getting video duration: {e}")
+        return 0
+
+def apply_video_transition_effect(video_path, output_folder):
+    """
+    מוסיף אפקט fade-out בשנייה האחרונה של הסרטון.
+    """
+    duration = get_video_duration(video_path)
+    fade_start = max(duration - 1, 0)
+
+    out_path = os.path.join(
+        output_folder,
+        f"transition_video_{os.path.basename(video_path)}"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", f"fade=t=out:st={fade_start}:d=1",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        out_path
+    ]
+    print(f"Applying fade-out to video: {video_path} -> {out_path}")
+    subprocess.run(cmd, check=True)
+    return out_path
+
+def add_subtitles_with_background(final_video_path, output_folder, subtitles):
+    """
+    מוסיף כתוביות לסרטון עם רקע ושקיפות, תוך אפקטי Fade-in ו-Fade-out.
+    ממקם אותן באזור שבין האמצע לתחתית (כ-75% גובה).
+    """
+    try:
+        print("Adding subtitles...")
+        drawtext_filters = []
+
+        for sub in subtitles:
+            text_escaped = (
+                sub['text']
+                .replace("'", "\\'")
+                .replace(':', '\\:')
+                .replace(',', '\\,')
+            )
+            start = sub['start_time']
+            end = sub['end_time']
+            duration = end - start
+
+            fade_in_duration = 0.3
+            fade_out_duration = 0.3
+
+            drawtext = (
+                f"drawtext=font='Arial':text='{text_escaped}':"
+                f"fontcolor=white@1.0:fontsize=36:"
+                f"x=(w-text_w)/2:y=(h*0.75):box=1:boxcolor=black@0.6:boxborderw=5:"
+                f"enable='between(t,{start},{end})':"
+                f"alpha='if(lte(t,{start + fade_in_duration}),"
+                f"(t-{start})/{fade_in_duration},"
+                f"if(lt(t,{end - fade_out_duration}),1,({end}-t)/{fade_out_duration}))'"
+            )
+            drawtext_filters.append(drawtext)
+
+        filter_complex = ",".join(drawtext_filters)
+        out_path = os.path.join(output_folder, "final_combined_video_with_subs.mp4")
+        cmd = [
+            "ffmpeg", "-y", "-i", final_video_path,
+            "-vf", filter_complex,
+            "-c:a", "copy",
+            out_path
+        ]
+        print(f"Adding subtitles to video: {final_video_path} -> {out_path}")
+        subprocess.run(cmd, check=True)
+
+        print(f"Subtitles added. Final video saved to: {out_path}")
+        return out_path
+    except Exception as e:
+        print(f"Error adding subtitles: {e}")
+        return final_video_path
+
+def combine_videos_and_audio_with_music(
+    video_paths,
+    audio_path,
+    output_folder,
+    music_tag=None,
+    subtitles=None
+):
+    """
+    מחבר רשימת סרטונים + שמע ה-TTS + מוזיקת רקע (אופציונלי) + כתוביות (אופציונלי).
+    """
+    try:
+        print("Normalizing videos...")
+        normalized_paths = normalize_videos(video_paths, output_folder)
+
+        print("Applying fade-out transition to each video...")
+        transition_paths = [
+            apply_video_transition_effect(v, output_folder)
+            for v in normalized_paths
+        ]
+
+        # יצירת קובץ טקסט לחיבור הסרטונים
+        list_file = os.path.join(output_folder, "video_list.txt")
+        with open(list_file, "w", encoding='utf-8') as f:
+            for tp in transition_paths:
+                f.write(f"file '{tp}'\n")
+        print(f"Created video list file at: {list_file}")
+
+        # קובץ זמני לחיבור כל הסרטונים
+        combined_temp = os.path.join(output_folder, "combined_video_temp.mp4")
+        concat_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", list_file,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", combined_temp
+        ]
+        print(f"Concatenating videos into: {combined_temp}")
+        subprocess.run(concat_cmd, check=True)
+
+        # קבלת אורך הסרטון
+        duration_cmd = [
+            "ffprobe", "-i", combined_temp,
+            "-show_entries", "format=duration",
+            "-v", "quiet", "-of", "csv=p=0"
+        ]
+        video_duration = float(subprocess.check_output(duration_cmd).strip())
+        print(f"Video duration: {video_duration} seconds")
+
+        # קבלת אורך האודיו (TTS)
+        duration_cmd = [
+            "ffprobe", "-i", audio_path,
+            "-show_entries", "format=duration",
+            "-v", "quiet", "-of", "csv=p=0"
+        ]
+        audio_duration = float(subprocess.check_output(duration_cmd).strip())
+        print(f"Audio duration: {audio_duration} seconds")
+
+        # השוואת אורך הסרטון לאורך השמע (TTS + מוזיקת רקע)
+        # נניח שמוזיקת הרקע מתווספת אחרי ה-TTS, לכן אורך השמע יהיה אורך ה-TTS
+        # אם אורך השמע ארוך יותר מהסרטון, נאריך את הסרטון
+        # אם אורך השמע קצר יותר, נחתוך את השמע
+
+        # השגת אורך השמע הכולל (TTS + מוזיקת רקע)
+        # נניח שהשמע והמוזיקה כבר ממוזגים ביחד בקובץ audio_path
+        total_audio_duration = audio_duration  # אם המוזיקה ו-TTS כבר מוזגים
+
+        print(f"Total audio duration (TTS + background music): {total_audio_duration} seconds")
+
+        # נכין משתנה לניהול הסרטון שלפיו נבצע מיקס סופי
+        final_video_path = combined_temp
+
+        if total_audio_duration > video_duration:
+            # נאריך את הסרטון כדי שיתאים לאורך השמע
+            extension_time = total_audio_duration - video_duration
+            print(f"Extending video by {extension_time} seconds to match audio duration.")
+
+            # ניצור סרטון מחזורי (looping) או נחתוך את הוידאו הקיים
+            loop_count = math.ceil(extension_time / video_duration)
+            print(f"Looping video {loop_count} times.")
+
+            looped_video = os.path.join(output_folder, "looped_video.mp4")
+            loop_cmd = [
+                "ffmpeg", "-y", "-stream_loop", str(loop_count),
+                "-i", combined_temp,
+                "-c", "copy",
+                looped_video
+            ]
+            print(f"Looping video: {combined_temp} -> {looped_video}")
+            subprocess.run(loop_cmd, check=True)
+
+            # חיתוך הסרטון למידת השמע
+            trimmed_video_path = os.path.join(output_folder, "combined_video_extended.mp4")
+            trim_cmd = [
+                "ffmpeg", "-y", "-i", looped_video,
+                "-t", f"{total_audio_duration:.2f}",
+                "-c", "copy",
+                trimmed_video_path
+            ]
+            print(f"Trimming extended video to match audio duration: {trimmed_video_path}")
+            subprocess.run(trim_cmd, check=True)
+
+            # כאן מתקנים: מעתה נשתמש בסרטון המורחב כבסיס למיקס השמע
+            final_video_path = trimmed_video_path
+
+        else:
+            # נחתוך את השמע למידת הסרטון
+            print("Audio is shorter than or equal to video duration. Trimming audio to match video duration.")
+            trimmed_audio_path = os.path.join(output_folder, "text_to_speech_trimmed.mp3")
+            trim_audio_cmd = [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-t", f"{video_duration:.2f}",
+                "-c:a", "aac",
+                trimmed_audio_path
+            ]
+            print(f"Trimming audio to match video duration: {trimmed_audio_path}")
+            subprocess.run(trim_audio_cmd, check=True)
+
+            # עדכון נתיב השמע לשימוש
+            audio_path = trimmed_audio_path
+
+            # וכאן נקבע שהסרטון הסופי (בשלב לפני מיקס השמע) נשאר כ- combined_temp
+            final_video_path = combined_temp
+
+        # כעת נוסיף את שמע ה-TTS ומוזיקת הרקע (אם יש)
+        final_path = os.path.join(output_folder, "final_combined_video.mp4")
+        background_music = get_background_music(music_tag) if music_tag else None
+
+        if background_music:
+            print(f"Adding TTS audio and background music from: {background_music}")
+            # נשתמש ב-duration=shortest כדי להבטיח שלא תתרחש חריגה באורכים
+            audio_mix_cmd = [
+                "ffmpeg", "-y",
+                "-i", final_video_path,
+                "-i", audio_path,
+                "-i", background_music,
+                "-filter_complex",
+                "[1:a]volume=1[aud];[2:a]volume=0.1[bgm];[aud][bgm]amix=inputs=2:duration=shortest",
+                "-c:v", "copy", "-c:a", "aac",
+                final_path
+            ]
+        else:
+            print("No background music selected. Adding only TTS audio.")
+            audio_mix_cmd = [
+                "ffmpeg", "-y",
+                "-i", final_video_path,
+                "-i", audio_path,
+                "-c:v", "copy", "-c:a", "aac",
+                "-shortest", final_path
+            ]
+
+        print(f"Mixing audio tracks into final video: {final_path}")
+        subprocess.run(audio_mix_cmd, check=True)
+
+        # הוספת כתוביות (אם יש)
+        if subtitles:
+            final_path = add_subtitles_with_background(final_path, output_folder, subtitles)
+
+        print(f"Final combined video saved to: {final_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg error: {e}")
+    except Exception as e:
+        print(f"Error combining videos and audio with music: {e}")
+def fetch_content_from_openai(prompt, progress_callback):
+    """
+    שולח פקודה ל-OpenAI API ומחזיר את הטקסט הממוסגר.
+    """
+    progress_callback("Fetching content from OpenAI...", 10)
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # יצירת prompt מתאים לקבלת טקסט בפורמט הנדרש
+    openai_prompt = (
+        f"Create a structured article for a video with the following format:\n"
+        f"◤Title◤ ˜Content˜ ◆Keyword1◆ ◆Keyword2◆ ◆Keyword3◆ #opt#\n\n"
+        f"Command: {prompt}"
+    )
+
+    data = {
+        "model": "gpt-4o-mini",  # השתמש במודל שלך כפי שבדוגמה
+        "messages": [{"role": "user", "content": openai_prompt}],
+        "max_tokens": 500
+    }
+
+    try:
+        print(f"Sending request to OpenAI API with prompt: {openai_prompt}")
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=data,
+            verify=False  # השבתת אימות SSL
+        )
+
+        if response.status_code == 200:
+            completion = response.json()
+            content = completion['choices'][0]['message']['content'].strip()
+            print("Content fetched successfully from OpenAI.")
+            progress_callback("Content fetched successfully!", 50)
+            return content
+        else:
+            progress_callback(f"Error fetching content: {response.status_code} {response.text}", 0)
+            print(f"Error fetching content: {response.status_code} {response.text}")
+            return None
+    except requests.exceptions.RequestException as e:
+        progress_callback(f"Request failed: {e}", 0)
+        print(f"Request failed: {e}")
+        return None
+
+def process_text_and_download(text, progress_callback):
+    """
+    פונקציה ראשית שמקבלת טקסט, מפיקה שמע (TTS), מורידה סרטונים, ומחברת הכל לסרטון סופי.
+    """
+    progress_callback("Processing text...", 10)
+    title, content, keywords = split_text(text)
+
+    if not content:
+        progress_callback("No content found to process.", 0)
+        print("No content found to process.")
+        return
+
+    if not keywords:
+        progress_callback("No keywords found for video download.", 0)
+        print("No keywords found for video download.")
+        return
+
+    # בחירת מוזיקה לפי האשטאג
+    music_tag = None
+    if "#opt" in text:
+        music_tag = "opt"
+    elif "#tense" in text:
+        music_tag = "tense"
+    elif "#sad" in text:
+        music_tag = "sad"
+
+    print(f"Selected music tag: {music_tag}")
+    progress_callback("Text processed successfully!", 30)
+    base_folder = r"C:\\Users\\akiva\\Desktop\\pex\\out"
+    unique_folder = create_unique_folder(base_folder)
+
+    # אפשר לשנות כאן את ה-offset אם הכתוביות מקדימות/מאחרות
+    # או ערכים אחרים כמו speech_rate, char_rate, max_words
+    subtitle_offset_seconds = -1.2  # דוגמה: מקדים את הכתוביות ב-1.2 שניות
+
+    # הכנת השמע ורשימת הכתוביות
+    print("Generating audio and subtitles from text...")
+    audio_path, subtitles = generate_audio_and_subtitles_from_text(
+        text="\n".join(content),
+        output_folder=unique_folder,
+        progress_callback=progress_callback,
+        speech_rate=150,      # מילים לדקה
+        char_rate=900,        # תווים לדקה
+        max_words=5,          # מקס' 5 מילים בכתובית
+        subtitle_offset=subtitle_offset_seconds
+    )
+
+    if not audio_path:
+        print("Audio generation failed.")
+        return
+
+    # מפתח API של Pixabay
+    pixabay_api_key = "47187494-2ced4af42d2da31adb7934901"  # החלף במפתח שלך
+
+    # הורדת סרטונים לפי מילות מפתח
+    video_paths = []
+    for kw in keywords:
+        vp = download_video_for_keyword(
+            api_key=pixabay_api_key,
+            keyword=kw,
+            download_folder=unique_folder,
+            progress_callback=progress_callback
+        )
+        if vp:
+            video_paths.append(vp)
+
+    if video_paths and audio_path:
+        print("Combining videos and audio with music...")
+        combine_videos_and_audio_with_music(
+            video_paths=video_paths,
+            audio_path=audio_path,
+            output_folder=unique_folder,
+            music_tag=music_tag,
+            subtitles=subtitles
+        )
+    else:
+        print("No videos or audio to combine.")
+
+def process_pipeline(prompt, progress_callback):
+    """
+    שלב ראשון: קבלת תוכן מ-OpenAI
+    שלב שני: עיבוד התוכן ליצירת הסרטון
+    """
+    content = fetch_content_from_openai(prompt, progress_callback)
+    if content:
+        process_text_and_download(content, progress_callback)
+
+def start_process():
+    """
+    מופעל בלחיצת כפתור, לוקח את הפקודה מתיבת הטקסט ומתחיל את התהליך בת'רד נפרד.
+    """
+    prompt = text_box.get("1.0", tk.END).strip()
+    if prompt:
+        print(f"Starting process with prompt: {prompt}")
+        Thread(target=process_pipeline, args=(prompt, update_progress)).start()
+    else:
+        feedback_label.config(text="Please provide a command.")
+        print("No command provided.")
+
+def update_progress(message, progress):
+    """
+    מעדכן את התווית ומתקן ההתקדמות (progress bar) בממשק.
+    """
+    feedback_label.config(text=message)
+    progress_bar['value'] = progress
+    root.update_idletasks()
+
+class AnimatedGif:
+    """
+    מחלקה להפעלת אנימציית GIF על גבי קנבס של Tkinter.
+    """
+    def __init__(self, canvas, gif_path):
+        self.canvas = canvas
+        self.frames = [
+            ImageTk.PhotoImage(frame)
+            for frame in ImageSequence.Iterator(Image.open(gif_path))
+        ]
+        self.frame_index = 0
+        self.image_on_canvas = None
+
+    def animate(self):
+        if self.image_on_canvas is not None:
+            self.canvas.itemconfig(self.image_on_canvas, image=self.frames[self.frame_index])
+        else:
+            self.image_on_canvas = self.canvas.create_image(
+                0, 0, anchor=tk.CENTER, image=self.frames[self.frame_index]
+            )
+        self.frame_index = (self.frame_index + 1) % len(self.frames)
+        self.canvas.after(30, self.animate)
+
+    def set_position(self, x, y):
+        if self.image_on_canvas is None:
+            self.image_on_canvas = self.canvas.create_image(x, y, image=self.frames[0])
+        else:
+            self.canvas.coords(self.image_on_canvas, x, y)
+
+def center_gif(event=None):
+    """
+    ממקם את ה-GIF במרכז הקנבס בעת שינוי הגודל של החלון.
+    """
+    canvas_width = canvas.winfo_width()
+    canvas_height = canvas.winfo_height()
+    gif.set_position(canvas_width // 2, canvas_height // 2)
+
+# יצירת ממשק המשתמש
+root = tk.Tk()
+root.title("Automated Video Creator")
+root.geometry("800x600")
+root.configure(bg="black")
+
+canvas = tk.Canvas(root, width=800, height=600, bg="black", highlightthickness=0)
+canvas.pack(fill=tk.BOTH, expand=True)
+
+if os.path.exists(gif_path):
+    gif = AnimatedGif(canvas, gif_path)
+    gif.animate()
+else:
+    print(f"GIF not found at {gif_path}")
+
+canvas.bind("<Configure>", center_gif)
+
+top_frame = tk.Frame(root, bg="black")
+top_frame.place(relx=0.5, rely=0.1, anchor=tk.CENTER)
+
+text_box = tk.Text(
+    top_frame,
+    width=60,
+    height=5,
+    font=("Arial", 16),
+    bg="#1e1e1e",
+    fg="white",
+    insertbackground="white",
+    relief=tk.FLAT,
+    wrap=tk.WORD
+)
+text_box.pack(pady=10)
+
+bottom_frame = tk.Frame(root, bg="black")
+bottom_frame.place(relx=0.5, rely=0.9, anchor=tk.CENTER)
+
+start_button = tk.Button(
+    bottom_frame,
+    text="Start",
+    font=("Arial", 16),
+    bg="#4caf50",
+    fg="white",
+    command=start_process
+)
+start_button.pack(pady=10)
+
+progress_bar = ttk.Progressbar(
+    bottom_frame,
+    orient="horizontal",
+    length=400,
+    mode="determinate"
+)
+progress_bar.pack(pady=10)
+
+feedback_label = tk.Label(
+    bottom_frame,
+    text="",
+    font=("Arial", 14),
+    bg="black",
+    fg="white"
+)
+feedback_label.pack(pady=10)
+
+root.mainloop()
